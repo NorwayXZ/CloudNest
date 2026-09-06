@@ -38,6 +38,7 @@ TLS_KEY = os.environ.get("TLS_KEY", "/etc/incus-cn-panel/panel.key")
 OPERATIONS_FILE = os.path.join(DATA_DIR, "operations.jsonl")
 CREDENTIALS_FILE = os.path.join(DATA_DIR, "credentials.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
+NODE_OWNERS_FILE = os.path.join(DATA_DIR, "node-owners.json")
 NOTIFICATION_CONFIG_FILE = os.path.join(DATA_DIR, "notification-config.json")
 NOTIFICATIONS_FILE = os.path.join(DATA_DIR, "notifications.json")
 TRAFFIC_FILE = os.path.join(DATA_DIR, "traffic-usage.json")
@@ -105,6 +106,7 @@ HOST_PORT_MAX = 65535
 MAX_PORTS_PER_INSTANCE = 1000
 USER_PASSWORD_ITERATIONS = 260000
 MAX_USER_ASSIGNMENTS = 500
+NODE_OWNER_ADMIN = "__admin__"
 USER_QUOTA_KEYS = ("max_instances", "cpu_percent", "memory_bytes", "disk_bytes", "traffic_bytes")
 MAX_JSON_BODY_BYTES = 128 * 1024
 MAX_NOTIFICATION_EVENTS = 500
@@ -580,6 +582,7 @@ def _public_user(username, record, instances=None):
     return {
         "username": username,
         "enabled": bool(record.get("enabled", True)),
+        "owned_nodes": [],
         "assignments": assignments,
         "created_at": str(record.get("created_at", "")),
         "quotas": quotas,
@@ -592,9 +595,18 @@ def list_user_accounts():
         _, instances = overview()
     except Exception:
         instances = []
+    owners = read_node_owners()
     with USERS_LOCK:
         users = _read_users_unlocked()
-        return [_public_user(username, users[username], instances) for username in sorted(users)]
+        return [
+            {
+                **_public_user(username, users[username], instances),
+                "owned_nodes": sorted(
+                    node for node, owner in owners.items() if owner == username
+                ),
+            }
+            for username in sorted(users)
+        ]
 
 
 def get_user_account(username):
@@ -697,7 +709,112 @@ def delete_user_account(username):
             raise ValueError("用户不存在")
         users.pop(username)
         _write_users_unlocked(users)
+    owners = read_node_owners()
+    reassigned = False
+    for node, owner in list(owners.items()):
+        if owner == username:
+            owners[node] = NODE_OWNER_ADMIN
+            reassigned = True
+    if reassigned:
+        _write_node_owners(owners)
     invalidate_user_sessions(username)
+
+
+def default_node_owners_data():
+    return {"version": 1, "nodes": {}}
+
+
+def read_node_owners():
+    with USERS_LOCK:
+        data = _read_private_json(NODE_OWNERS_FILE, default_node_owners_data())
+    nodes = data.get("nodes", {}) if isinstance(data.get("nodes"), dict) else {}
+    return {
+        str(node).lower(): str(owner).lower()
+        for node, owner in nodes.items()
+        if NAME_RE.fullmatch(str(node)) and str(owner).strip()
+    }
+
+
+def _write_node_owners(owners):
+    with USERS_LOCK:
+        _write_private_json(NODE_OWNERS_FILE, {
+            "version": 1,
+            "nodes": {str(node).lower(): str(owner).lower() for node, owner in owners.items()},
+        })
+
+
+def node_owner(node):
+    owner = read_node_owners().get(str(node).lower(), NODE_OWNER_ADMIN)
+    if owner in {NODE_OWNER_ADMIN, "admin", PANEL_USER.lower()}:
+        return PANEL_USER.lower()
+    return owner
+
+
+def validate_node_owner(owner):
+    owner = str(owner or PANEL_USER).strip().lower()
+    if owner == PANEL_USER.lower():
+        return owner
+    with USERS_LOCK:
+        if owner not in _read_users_unlocked():
+            raise ValueError("宿主机归属用户不存在")
+    return owner
+
+
+def set_node_owner(node, owner):
+    node = str(node).lower()
+    owner = validate_node_owner(owner)
+    if not NAME_RE.fullmatch(node):
+        raise ValueError("节点名称无效")
+    owners = read_node_owners()
+    owners[node] = NODE_OWNER_ADMIN if owner == PANEL_USER.lower() else owner
+    _write_node_owners(owners)
+    return node_owner(node)
+
+
+def delete_node_owner(node):
+    owners = read_node_owners()
+    removed = owners.pop(str(node).lower(), None) is not None
+    if removed:
+        _write_node_owners(owners)
+    return removed
+
+
+def node_is_owned_by_user(session, node):
+    return session.get("role") == "user" and node_owner(node) == str(
+        session.get("username", "")
+    ).lower()
+
+
+def session_can_access_node(session, node):
+    if session.get("role") == "admin":
+        return True
+    return node_is_owned_by_user(session, node)
+
+
+def session_can_manage_node(session, node):
+    return session_can_access_node(session, node)
+
+
+def session_can_manage_instance(session, node, name):
+    if session.get("role") == "admin":
+        return True
+    return node_is_owned_by_user(session, node) and session_can_access_instance(
+        session, node, name
+    )
+
+
+def require_instance_owner(session, node, name):
+    if not session_can_manage_instance(session, node, name):
+        raise PermissionError("只有管理员或宿主机所有者可以管理该实例")
+    return True
+
+
+def require_node_access(session, node, manage=False):
+    if not session_can_access_node(session, node):
+        raise PermissionError("无权访问该宿主机")
+    if manage and not session_can_manage_node(session, node):
+        raise PermissionError("无权管理该宿主机")
+    return require_node(node)
 
 
 def remove_instance_assignments(node, name=None):
@@ -752,6 +869,8 @@ def authenticate_account(username, password):
 
 def session_can_access_instance(session, node, name):
     if session.get("role") == "admin":
+        return True
+    if node_is_owned_by_user(session, node):
         return True
     record = get_user_account(session.get("username", ""))
     expires_at = assignment_map(record).get(f"{node}/{name}") if record else None
@@ -988,7 +1107,7 @@ def node_connection_failure(stage, exc, token="", address=""):
     return NodeConnectionError(stage, summaries.get(stage, "宿主机验证失败"), detail, hints)
 
 
-def add_remote(name, address, token):
+def add_remote(name, address, token, owner=None):
     with REMOTE_CONFIG_LOCK:
         try:
             remotes = registered_remotes()
@@ -1057,6 +1176,16 @@ def add_remote(name, address, token):
                 ],
                 422,
             )
+        if owner is not None:
+            try:
+                set_node_owner(name, owner)
+            except Exception:
+                try:
+                    run_incus("remote", "remove", name, timeout=20)
+                except Exception:
+                    pass
+                delete_node_settings(name)
+                raise
         return report
 
 
@@ -1734,9 +1863,21 @@ def node_live_rates(sample, previous, elapsed_seconds):
     return result
 
 
-def node_live_payload():
+def node_live_payload(allowed_nodes=None):
     with NODE_LIVE_LOCK:
+        if allowed_nodes is not None and not allowed_nodes:
+            return {
+                "nodes": [],
+                "interval_seconds": NODE_LIVE_INTERVAL_SECONDS,
+                "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
         remotes = registered_remotes()
+        if allowed_nodes is not None:
+            allowed = {str(name).lower() for name in allowed_nodes}
+            remotes = {
+                name: config for name, config in remotes.items()
+                if name.lower() in allowed
+            }
         started = time.monotonic()
         if remotes:
             with ThreadPoolExecutor(max_workers=min(8, len(remotes))) as executor:
@@ -1769,6 +1910,11 @@ def overview():
     with ThreadPoolExecutor(max_workers=min(8, len(remotes))) as executor:
         nodes = list(executor.map(lambda item: inspect_node(*item), remotes.items()))
     nodes.sort(key=lambda item: item["name"])
+    for node in nodes:
+        owner = node_owner(node["name"])
+        node["owner"] = owner
+        for instance in node.get("instances", []):
+            instance["node_owner"] = owner
     instances = [instance for node in nodes for instance in node.pop("instances")]
     attach_traffic_usage(instances)
     return nodes, instances
@@ -3689,30 +3835,49 @@ def overview_for_session(session):
             "domains": read_domain_routes(),
         }
     record = get_user_account(session["username"]) or {}
+    username = str(session["username"]).lower()
+    owned_nodes = {
+        node["name"] for node in nodes if node_owner(node["name"]) == username
+    }
     active = {
         key: expires_at for key, expires_at in assignment_map(record).items()
         if assignment_is_active(expires_at)
     }
-    visible_instances = [
-        {
-            **instance,
-            "authorization_expires_at": active[f"{instance['node']}/{instance['name']}"],
-        }
-        for instance in instances
-        if f"{instance['node']}/{instance['name']}" in active
-    ]
+    visible_instances = []
+    for instance in instances:
+        key = f"{instance['node']}/{instance['name']}"
+        if instance["node"] not in owned_nodes and key not in active:
+            continue
+        visible = dict(instance)
+        if key in active:
+            visible["authorization_expires_at"] = active[key]
+        if "node_owner" in instance:
+            visible["access_scope"] = (
+                "owned" if instance["node"] in owned_nodes else "assigned"
+            )
+        visible_instances.append(visible)
     visible_nodes = {
         instance["node"] for instance in visible_instances
     }
-    minimal_nodes = [
-        {"name": node["name"], "address": node["address"], "status": node["status"]}
-        for node in nodes if node["name"] in visible_nodes
-    ]
+    visible_nodes_payload = []
+    for node in nodes:
+        if node["name"] in owned_nodes:
+            visible = dict(node)
+            visible["owner"] = username
+            visible_nodes_payload.append(visible)
+        elif node["name"] in visible_nodes:
+            visible = {
+                "name": node["name"], "address": node["address"],
+                "status": node["status"],
+            }
+            if "owner" in node:
+                visible["access_scope"] = "assigned"
+            visible_nodes_payload.append(visible)
     return {
         "account": account,
-        "nodes": minimal_nodes,
+        "nodes": visible_nodes_payload,
         "instances": visible_instances,
-        "public_images": [],
+        "public_images": public_image_catalog(),
         "operations": [],
         "users": [],
         "notifications": {},
@@ -5168,11 +5333,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"users": list_user_accounts()})
             return
         if path == "/api/nodes/live":
-            auth = self.require_admin()
+            auth = self.require_auth()
             if not auth:
                 return
             try:
-                self.send_json(200, node_live_payload())
+                allowed_nodes = None if auth[1].get("role") == "admin" else {
+                    node for node, owner in read_node_owners().items()
+                    if owner == auth[1].get("username", "").lower()
+                }
+                self.send_json(200, node_live_payload(allowed_nodes))
             except Exception as exc:
                 self.send_json(500, {"error": str(exc)})
             return
@@ -5190,11 +5359,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         preflight_match = re.fullmatch(r"/api/nodes/([^/]+)/preflight", path)
         if preflight_match:
-            auth = self.require_admin()
+            auth = self.require_auth()
             if not auth:
                 return
             try:
-                node = require_node(preflight_match.group(1))
+                node = require_node_access(auth[1], preflight_match.group(1))
                 report = read_node_health(node)
                 if not report:
                     self.send_json(404, {"error": "该宿主机尚未执行接入体检"})
@@ -5217,6 +5386,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = {
                     "node": node, "name": name,
+                    "access_scope": "owned" if node_is_owned_by_user(auth[1], node) else "assigned",
+                    "can_manage": session_can_manage_instance(auth[1], node, name),
                     "snapshots": list_instance_snapshots(node, name),
                     "port_rules": [], "backups": [], "policy": {}, "nodes": [],
                 }
@@ -5263,15 +5434,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         images_match = re.fullmatch(r"/api/nodes/([^/]+)/images", path)
         if images_match:
-            auth = self.require_admin()
+            auth = self.require_auth()
             if not auth:
                 return
             try:
-                node = require_node(images_match.group(1))
+                node = require_node_access(auth[1], images_match.group(1))
                 self.send_json(200, {
                     "node": node,
                     "images": list_node_images(node),
-                    "public_images": public_image_catalog(),
+                    "public_images": public_image_catalog() if auth[1].get("role") == "admin" else [],
                 })
             except Exception as exc:
                 self.send_json(400, {"error": str(exc)})
@@ -5458,12 +5629,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(exc)})
             return
         if path == "/api/scheduler/plan":
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "需要管理员权限"})
-                return
             try:
                 data = self.read_json()
                 node_name = str(data.get("node", ""))
+                if not session_can_manage_node(auth[1], node_name):
+                    self.send_json(403, {"error": "无权使用该宿主机的资源调度器"})
+                    return
                 ensure_node_admitted(node_name, str(data.get("type", "container")))
                 node_info = live_node_info(node_name)
                 plan = scheduler_plan(
@@ -5492,11 +5663,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         preflight_match = re.fullmatch(r"/api/nodes/([^/]+)/preflight", path)
         if preflight_match:
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "需要管理员权限"})
-                return
             try:
-                node = require_node(preflight_match.group(1))
+                node = require_node_access(auth[1], preflight_match.group(1))
                 task = enqueue_task(
                     "node_preflight", f"体检宿主机 {node}", node=node, target=node,
                     payload={"node": node}, owner=auth[1]["username"],
@@ -5507,11 +5675,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         node_settings_match = re.fullmatch(r"/api/nodes/([^/]+)/settings", path)
         if node_settings_match:
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "需要管理员权限"})
-                return
             node = node_settings_match.group(1)
             try:
+                require_node_access(auth[1], node, manage=True)
                 settings = update_node_settings(node, self.read_json())
                 record_operation(
                     "node_settings", node, node,
@@ -5548,6 +5714,9 @@ class Handler(BaseHTTPRequestHandler):
             node, name = snapshot_match.groups()
             if not self.require_instance_access(auth[1], node, name):
                 return
+            if not session_can_manage_instance(auth[1], node, name):
+                self.send_json(403, {"error": "只有管理员或宿主机所有者可以管理实例快照"})
+                return
             try:
                 data = self.read_json()
                 action = str(data.get("action", "create"))
@@ -5572,6 +5741,9 @@ class Handler(BaseHTTPRequestHandler):
         if console_match:
             node, name = console_match.groups()
             if not self.require_instance_access(auth[1], node, name):
+                return
+            if not session_can_manage_instance(auth[1], node, name):
+                self.send_json(403, {"error": "只有管理员或宿主机所有者可以执行实例命令"})
                 return
             try:
                 output = run_instance_console(node, name, self.read_json().get("command", ""))
@@ -5788,9 +5960,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": str(exc)})
             return
         if path == "/api/nodes":
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "需要管理员权限"})
-                return
             name = ""
             try:
                 data = self.read_json()
@@ -5801,7 +5970,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("节点名称只能包含字母、数字和连字符")
                 if not 20 <= len(token) <= 12000:
                     raise ValueError("Trust Token 无效")
-                report = add_remote(name, address, token)
+                owner = PANEL_USER if auth[1].get("role") == "admin" else auth[1]["username"]
+                report = add_remote(name, address, token, owner)
                 result = "符合切割标准" if report.get("admission", {}).get("eligible") else "未通过切割准入"
                 record_operation("node_add", name, name, message=f"{address} · {result}")
                 self.send_json(201, {"ok": True, "preflight": report})
@@ -5817,12 +5987,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         copy_match = re.fullmatch(r"/api/nodes/([^/]+)/images/copy", path)
         if copy_match:
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "需要管理员权限"})
-                return
             node = copy_match.group(1)
             image_id = ""
             try:
+                require_node_access(auth[1], node, manage=True)
                 data = self.read_json()
                 image_id = str(data.get("image", ""))
                 alias = str(data.get("alias", "")).strip()
@@ -5838,13 +6006,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         upload_match = re.fullmatch(r"/api/nodes/([^/]+)/images/upload", path)
         if upload_match:
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "需要管理员权限"})
-                return
             node = upload_match.group(1)
             alias = self.headers.get("X-Image-Alias", "").strip()
             filename = ""
             try:
+                require_node_access(auth[1], node, manage=True)
                 filename = self.read_image_upload()
                 images = import_local_image(node, filename, alias)
                 record_operation("image_upload", alias or "本地镜像", node)
@@ -5863,16 +6029,13 @@ class Handler(BaseHTTPRequestHandler):
                         pass
             return
         if path == "/api/instances":
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "需要管理员权限"})
-                return
             node = ""
             name = ""
             try:
                 data = self.read_json()
                 node = str(data.get("node", ""))
                 name = str(data.get("name", ""))
-                require_node(node)
+                require_node_access(auth[1], node, manage=True)
                 if not NAME_RE.fullmatch(name):
                     raise ValueError("实例名称格式无效")
                 task = enqueue_task(
@@ -5881,19 +6044,19 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self.send_json(202, {"ok": True, "task": task})
             except Exception as exc:
+                if isinstance(exc, PermissionError):
+                    self.send_json(403, {"error": str(exc)})
+                    return
                 self.send_json(400, {"error": str(exc)})
             return
         if path == "/api/instances/batch":
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "需要管理员权限"})
-                return
             node = ""
             prefix = ""
             try:
                 data = self.read_json()
                 node = str(data.get("node", ""))
                 prefix = str(data.get("name_prefix", ""))
-                require_node(node)
+                require_node_access(auth[1], node, manage=True)
                 if not prefix:
                     raise ValueError("请填写批量名称前缀")
                 task = enqueue_task(
@@ -5902,33 +6065,35 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self.send_json(202, {"ok": True, "task": task})
             except Exception as exc:
+                if isinstance(exc, PermissionError):
+                    self.send_json(403, {"error": str(exc)})
+                    return
                 self.send_json(400, {"error": str(exc)})
             return
 
         access_match = re.fullmatch(r"/api/nodes/([^/]+)/instances/([^/]+)/access", path)
         if access_match:
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "只有管理员可以配置实例 SSH"})
-                return
             node = access_match.group(1)
             name = access_match.group(2)
             try:
+                require_instance_owner(auth[1], node, name)
                 access = configure_instance_access(node, name)
                 record_operation("instance_access", name, node)
                 self.send_json(200, {"ok": True, "access": access})
             except Exception as exc:
                 record_operation("instance_access", name, node, "failed", str(exc))
+                if isinstance(exc, PermissionError):
+                    self.send_json(403, {"error": str(exc)})
+                    return
                 self.send_json(400, {"error": str(exc)})
             return
 
         traffic_match = re.fullmatch(r"/api/nodes/([^/]+)/instances/([^/]+)/traffic", path)
         if traffic_match:
-            if auth[1].get("role") != "admin":
-                self.send_json(403, {"error": "只有管理员可以调整实例流量配额"})
-                return
             node = traffic_match.group(1)
             name = traffic_match.group(2)
             try:
+                require_instance_owner(auth[1], node, name)
                 data = self.read_json()
                 traffic = update_instance_traffic_quota(
                     node, name, data.get("traffic_limit_bytes", 0),
@@ -5945,6 +6110,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "traffic": traffic})
             except Exception as exc:
                 record_operation("instance_traffic_update", name, node, "failed", str(exc))
+                if isinstance(exc, PermissionError):
+                    self.send_json(403, {"error": str(exc)})
+                    return
                 self.send_json(400, {"error": str(exc)})
             return
 
@@ -5974,11 +6142,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path
-        auth = self.require_admin(csrf=True)
+        auth = self.require_auth(csrf=True)
         if not auth:
             return
         token_match = re.fullmatch(r"/api/account/tokens/([a-f0-9]{16})", path)
         if token_match:
+            if auth[1].get("role") != "admin":
+                self.send_json(403, {"error": "需要管理员权限"})
+                return
             try:
                 revoke_api_token(token_match.group(1))
                 record_operation("api_token_revoke", token_match.group(1), message="撤销 API Token")
@@ -5988,6 +6159,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         user_match = re.fullmatch(r"/api/users/([a-zA-Z0-9][a-zA-Z0-9_.-]{2,31})", path)
         if user_match:
+            if auth[1].get("role") != "admin":
+                self.send_json(403, {"error": "需要管理员权限"})
+                return
             username = user_match.group(1).lower()
             try:
                 delete_user_account(username)
@@ -5998,6 +6172,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         image_match = re.fullmatch(r"/api/nodes/([^/]+)/images/([a-fA-F0-9]{12,64})", path)
         if image_match:
+            if auth[1].get("role") != "admin":
+                self.send_json(403, {"error": "需要管理员权限"})
+                return
             node = image_match.group(1)
             fingerprint = image_match.group(2)
             try:
@@ -6011,13 +6188,14 @@ class Handler(BaseHTTPRequestHandler):
         node_match = re.fullmatch(r"/api/nodes/([^/]+)", path)
         if node_match:
             try:
-                node = require_node(node_match.group(1))
+                node = require_node_access(auth[1], node_match.group(1), manage=True)
                 with REMOTE_CONFIG_LOCK:
                     run_incus("remote", "remove", node, timeout=20)
                 delete_credentials(node)
                 remove_instance_assignments(node)
                 remove_traffic_usage(node)
                 delete_node_settings(node)
+                delete_node_owner(node)
                 record_operation("node_remove", node, node)
                 self.send_json(200, {"ok": True})
             except Exception as exc:
@@ -6031,12 +6209,16 @@ class Handler(BaseHTTPRequestHandler):
                 name = instance_match.group(2)
                 if not NAME_RE.fullmatch(name):
                     raise ValueError("实例名称无效")
+                require_instance_owner(auth[1], node, name)
                 task = enqueue_task(
                     "instance_delete", f"删除实例 {name}", node=node, target=name,
                     payload={"node": node, "name": name}, owner=auth[1]["username"],
                 )
                 self.send_json(202, {"ok": True, "task": task})
             except Exception as exc:
+                if isinstance(exc, PermissionError):
+                    self.send_json(403, {"error": str(exc)})
+                    return
                 self.send_json(400, {"error": str(exc)})
             return
         self.send_json(404, {"error": "接口不存在"})
